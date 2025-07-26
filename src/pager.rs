@@ -1,11 +1,15 @@
-use papaya::{Compute, HashMap, Operation, OwnedGuard};
+use papaya::{Compute, Guard, HashMap, LocalGuard, Operation};
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek as _, Write};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-type PageId = u64;
+pub type PageId = u64;
 
 pub struct Pager {
+    pub file: std::path::PathBuf,
+    pub page_size: u32,
     map: HashMap<PageId, PageLock>,
 }
 
@@ -14,33 +18,79 @@ struct PageLock {
     lock: RwLock<()>,
 }
 
-pub struct PageReadGuard<'a> {
-    pager: &'a Pager,
-    id: PageId,
+pub struct PageRead<'a> {
+    pub pager: &'a Pager,
+    pub id: PageId,
+    // This is unused because it doesn't "actually" guard anything in memory.
+    #[allow(unused)]
     rw_guard: RwLockReadGuard<'a, ()>,
-    map_guard: &'a OwnedGuard<'a>,
+    map_guard: &'a LocalGuard<'a>,
 }
 
-pub struct PageWriteGuard<'a> {
-    pager: &'a Pager,
-    id: PageId,
+pub struct PageWrite<'a> {
+    pub pager: &'a Pager,
+    pub id: PageId,
+    // This is unused because it doesn't "actually" guard anything in memory.
+    #[allow(unused)]
     rw_guard: RwLockWriteGuard<'a, ()>,
-    map_guard: &'a OwnedGuard<'a>,
+    map_guard: &'a LocalGuard<'a>,
 }
 
-impl Drop for PageReadGuard<'_> {
+impl PageRead<'_> {
+    pub fn read_into(&self, buf: &mut [u8], file: &mut File) -> Result<(), std::io::Error> {
+        if buf.len() != self.pager.page_size as usize {
+            return Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "Buf len should be = page size!",
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(
+            self.pager.page_size as u64 * self.id,
+        ));
+        file.read_exact(buf)
+    }
+}
+impl PageWrite<'_> {
+    pub fn read_into(&self, buf: &mut [u8], file: &mut File) -> Result<(), std::io::Error> {
+        if buf.len() != self.pager.page_size as usize {
+            return Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "Buf len should be = page size!",
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(
+            self.pager.page_size as u64 * self.id,
+        ));
+        file.read_exact(buf)
+    }
+
+    pub fn write(&self, buf: &[u8], file: &mut File) -> Result<(), std::io::Error> {
+        if buf.len() != self.pager.page_size as usize {
+            return Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "Buf len should be = page size!",
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(
+            self.pager.page_size as u64 * self.id,
+        ));
+        file.write_all(buf).map(|_| ())
+    }
+}
+
+impl Drop for PageRead<'_> {
     fn drop(&mut self) {
         try_gc(self.pager, self.id, self.map_guard);
     }
 }
 
-impl Drop for PageWriteGuard<'_> {
+impl Drop for PageWrite<'_> {
     fn drop(&mut self) {
         try_gc(self.pager, self.id, self.map_guard);
     }
 }
 
-fn try_gc(pager: &Pager, id: PageId, map_guard: &OwnedGuard) {
+fn try_gc(pager: &Pager, id: PageId, map_guard: &impl Guard) {
     let closure = |kv: Option<(&PageId, &PageLock)>| {
         match kv {
             Some((_id, v)) => {
@@ -94,20 +144,29 @@ fn try_gc(pager: &Pager, id: PageId, map_guard: &OwnedGuard) {
 }
 
 impl Pager {
-    pub fn new() -> Self {
+    pub fn new(file: std::path::PathBuf, page_size: u32) -> Self {
         Self {
             map: HashMap::new(),
+            file,
+            page_size,
         }
     }
 
-    pub async fn read_page<'a>(
-        &'a self,
-        id: PageId,
-        guard: &'a OwnedGuard<'a>,
-    ) -> PageReadGuard<'a> {
+    pub fn open_file(&self) -> Result<File, std::io::Error> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.file)
+    }
+
+    pub fn get_guard(&self) -> LocalGuard {
+        self.map.guard()
+    }
+
+    pub fn read_page<'a>(&'a self, id: PageId, guard: &'a LocalGuard<'a>) -> PageRead<'a> {
         let lock = self.get_lock(id, guard);
-        let rw_guard = lock.read().await;
-        PageReadGuard {
+        let rw_guard = lock.read().expect("Shouldn't be poisoned");
+        PageRead {
             pager: self,
             id,
             rw_guard,
@@ -115,14 +174,10 @@ impl Pager {
         }
     }
 
-    pub async fn write_page<'a>(
-        &'a self,
-        id: PageId,
-        guard: &'a OwnedGuard<'a>,
-    ) -> PageWriteGuard<'a> {
+    pub fn write_page<'a>(&'a self, id: PageId, guard: &'a LocalGuard<'a>) -> PageWrite<'a> {
         let lock = self.get_lock(id, guard);
-        let rw_guard = lock.write().await;
-        PageWriteGuard {
+        let rw_guard = lock.write().expect("Shouldn't be poisoned");
+        PageWrite {
             pager: self,
             id,
             rw_guard,
@@ -130,7 +185,7 @@ impl Pager {
         }
     }
 
-    pub fn get_lock<'a>(&'a self, id: PageId, guard: &'a OwnedGuard<'a>) -> &'a RwLock<()> {
+    pub fn get_lock<'a>(&'a self, id: PageId, guard: &'a LocalGuard<'a>) -> &'a RwLock<()> {
         fn closure<'a>(
             kv: Option<(&'a PageId, &'a PageLock)>,
         ) -> Operation<PageLock, &'a RwLock<()>> {
